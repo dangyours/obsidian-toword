@@ -53,6 +53,7 @@ interface DocumentElement {
 	alignments?: string[];
 	language?: string;
 	listType?: 'ordered' | 'unordered';
+	start?: number;
 	items?: string[];
 	tasks?: Array<{ checked: boolean; text: string }>;
 	quoteLevel?: number;
@@ -71,6 +72,8 @@ export class MarkdownToDocxConverter {
 	private footnotes: { [key: string]: string } = {};
 	private usedFootnotes: string[] = [];
 	private imageCounter: number = 0;
+	private nextOrderedListNumId: number = 3;
+	private orderedListStarts: Map<number, number> = new Map();
 	private imageRelationships: Array<{id: string, data: ArrayBuffer, extension: string}> = [];
 	private md: MarkdownIt;
 
@@ -230,6 +233,7 @@ export class MarkdownToDocxConverter {
 		// This must run regardless of the preprocessing toggle so that math
 		// expressions don't interfere with bold/italic parsing.
 		cleanedMarkdown = this.convertMathNotation(cleanedMarkdown);
+		cleanedMarkdown = this.stripComments(cleanedMarkdown);
 		
 		if (this.settings.enablePreprocessing) {
 			cleanedMarkdown = this.preprocessMarkdown(cleanedMarkdown);
@@ -402,6 +406,57 @@ export class MarkdownToDocxConverter {
 		}
 		// No closing fence found — return original content unchanged
 		return markdown;
+	}
+
+	// Strip Obsidian comments (%%...%%) from the markdown.
+	// Comments may span multiple lines; content inside fenced code blocks is left untouched.
+	private stripComments(markdown: string): string {
+		const lines = markdown.split('\n');
+		let inFence = false;
+		let inComment = false;
+		const output: string[] = [];
+
+		for (let line of lines) {
+			if (/^\s*(```|~~~)/.test(line)) {
+				inFence = !inFence;
+				output.push(line);
+				continue;
+			}
+			if (inFence) {
+				output.push(line);
+				continue;
+			}
+
+			let result = '';
+			if (inComment) {
+				const endIdx = line.indexOf('%%');
+				if (endIdx === -1) {
+					output.push('');
+					continue;
+				}
+				inComment = false;
+				line = line.slice(endIdx + 2);
+			}
+
+			let remaining = line;
+			let startIdx = remaining.indexOf('%%');
+			while (startIdx !== -1) {
+				result += remaining.slice(0, startIdx);
+				const closeIdx = remaining.indexOf('%%', startIdx + 2);
+				if (closeIdx === -1) {
+					// Comment continues onto the following line(s)
+					inComment = true;
+					remaining = '';
+					break;
+				}
+				remaining = remaining.slice(closeIdx + 2);
+				startIdx = remaining.indexOf('%%');
+			}
+			result += remaining;
+			output.push(result);
+		}
+
+		return output.join('\n');
 	}
 
 	// Pre-process markdown to fix common conversion issues
@@ -683,6 +738,8 @@ export class MarkdownToDocxConverter {
 
 	private generateDocx(elements: DocumentElement[], title: string): Blob {
 		// Generate document XML first (this processes images and populates imageRelationships)
+		this.nextOrderedListNumId = 3;
+		this.orderedListStarts.clear();
 		const documentXml = this.getDocumentXml(elements);
 
 		// Create files object for fflate
@@ -823,7 +880,47 @@ ${imageRels}</Relationships>`;
   <w:num w:numId="2">
     <w:abstractNumId w:val="1"/>
   </w:num>
+  ${this.getExtraNumInstances()}
 </w:numbering>`;
+	}
+
+	// Emit a distinct abstractNum (with unique nsid) + num instance for every ordered
+	// list so each restarts at its own literal start number (matching the markdown
+	// source). Sharing a single abstractNum across separate <w:num> elements makes
+	// Word continue the numbering across lists.
+	private getExtraNumInstances(): string {
+		let xml = '';
+		for (let numId = 3; numId < this.nextOrderedListNumId; numId++) {
+			const nsid = numId.toString(16).toUpperCase().padStart(4, '0');
+			const start = this.orderedListStarts.get(numId) || 1;
+			xml += `<w:abstractNum w:abstractNumId="${numId}">
+    <w:nsid w:val="${nsid}"/>
+    <w:multiLevelType w:val="singleLevel"/>
+    <w:lvl w:ilvl="0">
+      <w:start w:val="${start}"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr>
+        <w:ind w:left="720" w:hanging="360"/>
+      </w:pPr>
+    </w:lvl>
+    <w:lvl w:ilvl="1">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="lowerLetter"/>
+      <w:lvlText w:val="%2."/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr>
+        <w:ind w:left="1440" w:hanging="360"/>
+      </w:pPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="${numId}">
+    <w:abstractNumId w:val="${numId}"/>
+  </w:num>
+`;
+		}
+		return xml;
 	}
 
 	private getStylesXml(): string {
@@ -835,7 +932,7 @@ ${imageRels}</Relationships>`;
   <w:docDefaults>
     <w:rPrDefault>
       <w:rPr>
-        <w:rFonts w:ascii="${fontFamily}" w:hAnsi="${fontFamily}" w:cs="${fontFamily}"/>
+        <w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="${fontFamily}"/>
         <w:sz w:val="${fontSize}"/>
         <w:szCs w:val="${fontSize}"/>
         <w:lang w:val="en-US"/>
@@ -843,7 +940,7 @@ ${imageRels}</Relationships>`;
     </w:rPrDefault>
     <w:pPrDefault>
       <w:pPr>
-        <w:spacing w:after="120" w:line="276" w:lineRule="auto"/>
+        <w:spacing w:after="120" w:line="240" w:lineRule="auto"/>
       </w:pPr>
     </w:pPrDefault>
   </w:docDefaults>
@@ -851,7 +948,7 @@ ${imageRels}</Relationships>`;
     <w:name w:val="Normal"/>
     <w:qFormat/>
     <w:rPr>
-      <w:rFonts w:ascii="${fontFamily}" w:hAnsi="${fontFamily}" w:cs="${fontFamily}"/>
+      <w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="${fontFamily}"/>
       <w:sz w:val="${fontSize}"/>
       <w:szCs w:val="${fontSize}"/>
     </w:rPr>
@@ -884,7 +981,7 @@ ${imageRels}</Relationships>`;
       <w:outlineLvl w:val="${i - 1}"/>
     </w:pPr>
     <w:rPr>
-      <w:rFonts w:ascii="${fontFamily}" w:hAnsi="${fontFamily}" w:cs="${fontFamily}"/>
+      <w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="${fontFamily}"/>
       <w:b/>
       <w:bCs/>
       <w:sz w:val="${sizeInHalfPoints}"/>
@@ -922,7 +1019,7 @@ ${imageRels}</Relationships>`;
     </w:rPr>
     <w:pPr>
       <w:shd w:val="clear" w:color="auto" w:fill="F8F8F8"/>
-      <w:spacing w:before="120" w:after="120" w:line="276" w:lineRule="auto"/>
+      <w:spacing w:before="120" w:after="120" w:line="240" w:lineRule="auto"/>
       <w:ind w:left="240" w:right="240"/>
       <w:contextualSpacing/>
       <w:bdr>
@@ -1031,10 +1128,13 @@ ${imageRels}</Relationships>`;
 
 	private paragraphToXml(element: DocumentElement): string {
 		const text = this.escapeXml(element.content || '');
-		
+		const indent = this.shouldIndentParagraph(element.content || '')
+			? '<w:ind w:firstLineChars="200" w:firstLine="480"/>'
+			: '';
+
 		if (!this.settings.preserveFormatting) {
 			return `<w:p>
-  <w:pPr></w:pPr>
+  <w:pPr>${indent}</w:pPr>
   <w:r>
     <w:t>${text}</w:t>
   </w:r>
@@ -1045,9 +1145,20 @@ ${imageRels}</Relationships>`;
 		const runs = this.parseInlineFormatting(element.content || '');
 		
 		return `<w:p>
-  <w:pPr></w:pPr>
+  <w:pPr>${indent}</w:pPr>
   ${runs}
 </w:p>`;
+	}
+
+	private shouldIndentParagraph(content: string): boolean {
+		const trimmed = content.trim();
+		if (!trimmed) {
+			return false;
+		}
+		// Paragraphs that start with bold text (used as a lead-in/subheading)
+		// keep their flush left-alignment; everything else gets a 2-char indent.
+		const startsWithBold = /^(?:\*\*[\s\S]*?\*\*|__[^_\n]*__|<(?:b|strong)>)/.test(trimmed);
+		return !startsWithBold;
 	}
 
 	private codeBlockToXml(element: DocumentElement): string {
@@ -1269,11 +1380,18 @@ ${imageRels}</Relationships>`;
 		const items = element.items || [];
 		const children = element.children || [];
 
+		// Each separate ordered list gets its own numId so Word restarts numbering
+		// from the list's literal start number (matching the markdown source).
+		const numId = element.listType === 'ordered' ? this.nextOrderedListNumId++ : 1;
+		if (element.listType === 'ordered') {
+			this.orderedListStarts.set(numId, element.start || 1);
+		}
+
 		for (let i = 0; i < items.length; i++) {
 			const item = items[i];
 			const childElement = children[i];
 			const level = Math.min(childElement?.level || 0, 8); // Word supports max 9 levels (0-8)
-			const runs = this.parseInlineFormatting(item);
+			const runs = this.parseListItemFormatting(item);
 			
 			// Calculate indentation based on level - more generous spacing for readability
 			const leftIndent = 720 + (level * 540); // 0.5 inch base + 0.375 inch per level
@@ -1286,7 +1404,7 @@ ${imageRels}</Relationships>`;
     <w:ind w:left="${leftIndent}" w:hanging="${hanging}"/>
     <w:numPr>
       <w:ilvl w:val="${level}"/>
-      <w:numId w:val="${element.listType === 'ordered' ? '2' : '1'}"/>
+      <w:numId w:val="${numId}"/>
     </w:numPr>
     <w:spacing w:before="60" w:after="60"/>
   </w:pPr>
@@ -1708,15 +1826,15 @@ ${imageRels}</Relationships>`;
 		
 		// 2. Handle complex nested patterns (***text*** - bold+italic)
 		result = result.replace(/\*\*\*([^*\n]+?)\*\*\*/g, '|||BOLDITALIC|||$1|||/BOLDITALIC|||');
-		result = result.replace(/___([^_\n]+?)___/g, '|||BOLDITALIC|||$1|||/BOLDITALIC|||');
+		result = result.replace(/(^|[^\w])___([^_\n]+?)___(?=$|[^\w])/g, '$1|||BOLDITALIC|||$2|||/BOLDITALIC|||');
 		
 		// 3. Regular bold and italic (simple, non-nested cases first)
 		result = result.replace(/\*\*([^*\n]+?)\*\*/g, '|||BOLD|||$1|||/BOLD|||');
 		result = result.replace(/\*([^*\n]+?)\*/g, '|||ITALIC|||$1|||/ITALIC|||');
 		
-		// 5. Underscore variants
-		result = result.replace(/__([^_\n]+?)__/g, '|||BOLD|||$1|||/BOLD|||');
-		result = result.replace(/_([^_\n]+?)_/g, '|||ITALIC|||$1|||/ITALIC|||');
+		// 5. Underscore variants (word-boundary aware so foo_bar / file_name stay literal)
+		result = result.replace(/(^|[^\w])__([^_\n]+?)__(?=$|[^\w])/g, '$1|||BOLD|||$2|||/BOLD|||');
+		result = result.replace(/(^|[^\w])_([^_\n]+?)_(?=$|[^\w])/g, '$1|||ITALIC|||$2|||/ITALIC|||');
 		
 		// 6. Other formatting
 		result = result.replace(/~~([^~\n]+?)~~/g, '|||STRIKE|||$1|||/STRIKE|||');
@@ -1972,6 +2090,38 @@ ${imageRels}</Relationships>`;
 		return result;
 	}
 
+	private parseListItemFormatting(item: string): string {
+		const segments = item.split('\n');
+		return segments.map((segment, index) => {
+			const runs = this.parseInlineFormatting(segment);
+			if (index === 0) return runs;
+			return `<w:r><w:br/></w:r>${runs}`;
+		}).join('');
+	}
+
+	private isListBreakLine(line: string): boolean {
+		const t = line.trim();
+		// Headings
+		if (/^#{1,6}(\s|$)/.test(t)) return true;
+		// Code fences
+		if (/^(```|~~~)/.test(t)) return true;
+		// Blockquotes
+		if (t.startsWith('>')) return true;
+		// Tables
+		if (t.startsWith('|')) return true;
+		// HTML blocks
+		if (t.startsWith('<')) return true;
+		// Images
+		if (/^!\[\[/.test(t) || /^!\[/.test(t)) return true;
+		// Horizontal rules
+		const cleaned = t.replace(/\s/g, '');
+		if (t.length >= 3 && /^(-{3,}|\*{3,}|_{3,})$/.test(cleaned)) return true;
+		// Task list items and other list markers
+		if (/^[-*+]\s+\[[ x]\]\s+/.test(t)) return true;
+		if (/^[-*+]\s+/.test(t)) return true;
+		return false;
+	}
+
 	private async parseMarkdownToElements(markdown: string): Promise<DocumentElement[]> {
 		const elements: DocumentElement[] = [];
 		const lines = markdown.split('\n');
@@ -2085,22 +2235,56 @@ ${imageRels}</Relationships>`;
 
 			// Handle ordered list items
 			if (trimmedLine.match(/^\d+\.\s+/)) {
-				const content = trimmedLine.replace(/^\d+\.\s+/, '').trim();
+				const items: string[] = [];
+				const start = parseInt(trimmedLine.match(/^(\d+)\.\s+/)?.[1] || '1', 10);
+				let j = i;
+				let blankPending = false;
 				
-				// Check if previous element is also an ordered list
-				const lastElement = elements[elements.length - 1];
-				if (lastElement && lastElement.type === 'list' && lastElement.listType === 'ordered' && lastElement.items) {
-					// Add to existing list
-					lastElement.items.push(content);
-				} else {
-					// Create new list
-					elements.push({
-						type: 'list',
-						listType: 'ordered',
-						items: [content]
-					});
+				// Consume the full list: consecutive numbered lines (even when separated by
+				// blank lines) plus "lazy continuation" lines that belong to the current item.
+				// This keeps 1./2./3. items grouped in ONE list so Word numbers them 1,2,3
+				// instead of restarting at 1 for every item.
+				while (j < lines.length) {
+					const currentLine = lines[j].trim();
+					if (!currentLine) {
+						blankPending = true;
+						j++;
+						continue;
+					}
+					
+					const itemMatch = currentLine.match(/^(\d+)\.\s+(.+)$/);
+					if (itemMatch) {
+						items.push(itemMatch[2].trim());
+						blankPending = false;
+						j++;
+						continue;
+					}
+					
+					// A heading, image, fence, other list, etc. ends this list
+					if (this.isListBreakLine(currentLine)) {
+						break;
+					}
+					
+					// A paragraph after a blank line interrupts the list
+					if (blankPending) {
+						break;
+					}
+					
+					// Lazy continuation line: belongs to the current item
+					if (items.length > 0) {
+						items[items.length - 1] += '\n' + currentLine;
+					}
+					j++;
 				}
-				i++;
+				
+				// Create new list
+				elements.push({
+					type: 'list',
+					listType: 'ordered',
+					start: start,
+					items: items
+				});
+				i = j;
 				continue;
 			}
 

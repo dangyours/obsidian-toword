@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, FileSystemAdapter, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 import { MarkdownToDocxConverter } from './converter-mobile';
 
 interface ToWordSettings {
@@ -6,8 +6,9 @@ interface ToWordSettings {
 	defaultFontSize: number;
 	includeMetadata: boolean;
 	preserveFormatting: boolean;
-	outputLocation: 'same-folder' | 'vault-root' | 'custom-folder';
+	outputLocation: 'same-folder' | 'vault-root' | 'custom-folder' | 'system-folder';
 	customOutputFolder: string;
+	systemOutputFolder: string;
 	useObsidianAppearance: boolean;
 	includeFilenameAsHeader: boolean;
 	pageSize: 'A4' | 'A5' | 'A3' | 'Letter' | 'Legal' | 'Tabloid';
@@ -22,6 +23,7 @@ const DEFAULT_SETTINGS: ToWordSettings = {
 	preserveFormatting: true,
 	outputLocation: 'same-folder',
 	customOutputFolder: 'Exports',
+	systemOutputFolder: '',
 	useObsidianAppearance: false,
 	includeFilenameAsHeader: false,
 	pageSize: 'A4',
@@ -304,6 +306,13 @@ export default class ToWordPlugin extends Plugin {
 			}
 			
 			outputPath = customDir ? `${customDir}/${filename}` : filename;
+		} else if (this.settings.outputLocation === 'system-folder') {
+			// Save to an absolute path on the system (desktop only)
+			const absPath = await this.saveDocxToSystemFolder(arrayBuffer, filename);
+			if (!absPath) {
+				return '';
+			}
+			return absPath;
 		}
 		
 		// Save the file
@@ -311,6 +320,56 @@ export default class ToWordPlugin extends Plugin {
 		
 		// Return the output path so we can show it in the success message
 		return outputPath;
+	}
+
+	async saveDocxToSystemFolder(arrayBuffer: ArrayBuffer, filename: string): Promise<string> {
+		const adapter = this.app.vault.adapter;
+		const rawFolder = (this.settings.systemOutputFolder || '').trim().replace(/[\\/]+$/, '');
+		
+		if (!rawFolder) {
+			new Notice('No system output folder configured');
+			return '';
+		}
+		
+		if (!(adapter instanceof FileSystemAdapter)) {
+			new Notice('System folder export is only supported on desktop');
+			return '';
+		}
+		
+		const targetPath = `${rawFolder}/${filename}`;
+		
+		try {
+			// Convert the absolute target path to a vault-relative path using ".." segments.
+			// Obsidian's normalizePath resolves "..", which lets us write outside the vault.
+			const relativePath = toVaultRelativePath(targetPath, adapter.getBasePath());
+			
+			const relativeDir = relativePath.substring(0, relativePath.lastIndexOf('/'));
+			if (relativeDir && !(await adapter.exists(relativeDir))) {
+				await adapter.mkdir(relativeDir);
+			}
+			
+			await adapter.writeBinary(relativePath, arrayBuffer);
+			return targetPath;
+		} catch (err) {
+			// Same-drive ".." trick may fail when the vault and target are on different
+			// Windows drives (cannot reach D:\ from C:\ via ".."). Fall back to direct
+			// filesystem access on desktop, guarded for mobile safety.
+			if (Platform.isDesktopApp) {
+				try {
+					const fs = window.require('fs');
+					fs.mkdirSync(dirname(targetPath), { recursive: true });
+					fs.writeFileSync(targetPath, Buffer.from(arrayBuffer));
+					return targetPath;
+				} catch (fsErr) {
+					console.error('Failed to write to system folder:', err, fsErr);
+					new Notice(`Failed to write to system folder: ${err instanceof Error ? err.message : String(err)}`);
+					return '';
+				}
+			}
+			console.error('Failed to write to system folder:', err);
+			new Notice(`Failed to write to system folder: ${err instanceof Error ? err.message : String(err)}`);
+			return '';
+		}
 	}
 
 	async loadSettings() {
@@ -410,16 +469,22 @@ class ToWordSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Output location')
 			.setDesc('Where to save the exported Word documents')
-			.addDropdown(dropdown => dropdown
-				.addOption('same-folder', 'Same folder as markdown file')
-				.addOption('vault-root', 'Vault root')
-				.addOption('custom-folder', 'Custom folder')
-				.setValue(this.plugin.settings.outputLocation)
-				.onChange(async (value) => {
-					this.plugin.settings.outputLocation = value as 'same-folder' | 'vault-root' | 'custom-folder';
-					await this.plugin.saveSettings();
-					this.renderSettings();
-				}));
+			.addDropdown(dropdown => {
+				dropdown
+					.addOption('same-folder', 'Same folder as markdown file')
+					.addOption('vault-root', 'Vault root')
+					.addOption('custom-folder', 'Custom folder');
+				if (Platform.isDesktopApp) {
+					dropdown.addOption('system-folder', 'System folder (outside vault)');
+				}
+				return dropdown
+					.setValue(this.plugin.settings.outputLocation)
+					.onChange(async (value) => {
+						this.plugin.settings.outputLocation = value as 'same-folder' | 'vault-root' | 'custom-folder' | 'system-folder';
+						await this.plugin.saveSettings();
+						this.renderSettings();
+					});
+			});
 
 		if (this.plugin.settings.outputLocation === 'custom-folder') {
 			new Setting(containerEl)
@@ -430,6 +495,19 @@ class ToWordSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.customOutputFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.customOutputFolder = value.replace(/^\/+|\/+$/g, '');
+						await this.plugin.saveSettings();
+					}));
+		}
+
+		if (this.plugin.settings.outputLocation === 'system-folder') {
+			new Setting(containerEl)
+				.setName('System output folder')
+				.setDesc('Absolute path outside the vault (e.g., "D:\\Exports" or "/home/user/Exports"). Must be on the same drive as the vault; the folder will be created if it does not exist.')
+				.addText(text => text
+					.setPlaceholder('D:\\Exports')
+					.setValue(this.plugin.settings.systemOutputFolder)
+					.onChange(async (value) => {
+						this.plugin.settings.systemOutputFolder = value;
 						await this.plugin.saveSettings();
 					}));
 		}
@@ -474,4 +552,38 @@ class ToWordSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 	}
+}
+
+function dirname(path: string): string {
+	const idx = path.replace(/\\/g, '/').lastIndexOf('/');
+	return idx === -1 ? '.' : path.substring(0, idx);
+}
+
+// Convert an absolute system path into a vault-relative path expressed with ".." segments
+// so it can be written through Obsidian's adapter (which only accepts vault-relative paths).
+// Example: target "D:/Docs/out.docx" from vault base "D:/Vault" -> "../Docs/out.docx"
+function toVaultRelativePath(targetPath: string, basePath: string): string {
+	const normalize = (p: string) => p.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+	const target = normalize(targetPath);
+	const base = normalize(basePath);
+	
+	const targetParts = target.split('/').filter(p => p !== '');
+	const baseParts = base.split('/').filter(p => p !== '');
+	
+	// Find the common prefix (drive letter / volume / root segments must match)
+	let common = 0;
+	const maxCommon = Math.min(targetParts.length, baseParts.length);
+	while (common < maxCommon && targetParts[common].toLowerCase() === baseParts[common].toLowerCase()) {
+		common++;
+	}
+	
+	// If the roots differ (e.g. different Windows drives), no ".." path can reach it
+	if (common === 0) {
+		throw new Error(`Cannot reach "${targetPath}" from vault at "${basePath}" (different drive/root)`);
+	}
+	
+	const ups = '../'.repeat(baseParts.length - common);
+	const down = targetParts.slice(common).join('/');
+	
+	return down ? ups + down : (ups.slice(0, -1) || '.');
 }
